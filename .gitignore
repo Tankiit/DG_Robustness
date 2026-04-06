@@ -1,5 +1,38 @@
-__pycache__
-domainbed/facebook.py
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+*.egg-info/
+.eggs/
+dist/
+build/
 
+# --- OS / editor ---
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# --- DomainBed upstream (existing) ---
+domainbed/facebook.py
 domainbed/data/*
 train_output/*
+
+# --- Experiment outputs & heavy artifacts (keep repo source-only) ---
+domainbed/credal_dg_results/
+domainbed/robust_dg_results/
+domainbed/scripts/credal_dg_results/
+
+# Feature / checkpoint caches (can be large)
+*.pt
+*.pth
+*.ckpt
+
+# Optional: local datasets or downloads (uncomment if you store data under repo)
+# data/
+# datasets/
