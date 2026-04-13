@@ -1,47 +1,21 @@
-"""
-credal_dg_pacs.py
-=================
-Credal IIPM vs MMD for Domain Generalisation — PACS dataset.
+from __future__ import annotations
 
-PRIMARY METHOD: Credal ellipsoid from MC Dropout (H stochastic passes).
-  - ε(x)   = sqrt(mean_d σ²_d(x))  — TV outer approximation radius
-  - ε_dom  = mean_x ε(x)            — domain-level contamination
-  - MMI    = 2·max_d σ_d            — support function at widest direction
-  - All quantities live in feature space (D=512), same space as MMD.
-  - Direct theoretical connection via C(x) ⊆ B_ε(μ(x)) [Mukherjee et al.]
-  - No training required. No sensitivity to epoch count.
+"""Credal DG / epistemic-uncertainty experiments (PACS-focused CLI).
 
-ABLATION (kept for later): Laplace approximation on linear head.
-  - fit_and_query_laplace() is preserved but NOT called in run_experiment().
-  - ε lives in logit space (C=7); requires bridging argument for paper.
-  - Sensitive to head_epochs — use ≤15 if you call it.
-
-Architecture:
-  - Frozen ResNet-18 backbone (ImageNet pretrained)
-  - Dropout(p=0.15) on penultimate 512-dim features
-  - H=5 stochastic passes per target domain → Σ_epi(x)
-
-USAGE:
-  python credal_dg_pacs.py --pacs_root /path/to/PACS
-  python credal_dg_pacs.py --pacs_root /path/to/PACS --H 10
-  python credal_dg_pacs.py --pacs_root /path/to/PACS --max_samples 100
-
-OUTPUTS (in ./credal_dg_results/):
-  results.json
-  fig_iipm_vs_mmd.pdf
-  fig_dro_mmi_triangle.pdf
-  table_latex.tex
-
-RUNTIME (MPS, ResNet-18, PACS, H=5, 400 samples/domain):
-  Feature extraction (H passes):  ~3-5 min total
-  Total:                          ~5-8 min  (no Laplace fitting)
+For the NeurIPS-style local and MPS experiment suite (Tables 1–3, OfficeHome,
+CIFAR-10-C, H and backbone ablations, certificate outputs), see
+``credal_dg_local.py`` in this directory. DomainNet-scale runs use
+``credal_dg_modal.py``.
 """
 
 import argparse
 import json
+import math
 import warnings
+from abc import ABC, abstractmethod
+from itertools import product
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import matplotlib
@@ -52,7 +26,10 @@ from scipy.stats import spearmanr
 import torch
 import torch.nn as nn
 import torchvision.models as tvm
-from torch.utils.data import DataLoader, Dataset, TensorDataset
+import torchvision.models as tv_models
+import torchvision.transforms as TVT
+from PIL import Image as PILImage
+from torch.utils.data import DataLoader, Dataset, Subset, TensorDataset
 from laplace import Laplace   # used only in fit_and_query_laplace (ablation)
 
 warnings.filterwarnings('ignore')
@@ -90,11 +67,6 @@ IMAGENET_STD  = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 # =============================================================================
 
 def parse_label_file(label_file: str, img_root: str) -> List[Tuple[str, int]]:
-    """
-    Parse a PACS kfold label file.
-    Each line: <relative_path> <class_index>
-    Returns list of (absolute_image_path, class_index).
-    """
     samples = []
     label_path = Path(label_file)
     if not label_path.exists():
@@ -121,7 +93,6 @@ def parse_label_file(label_file: str, img_root: str) -> List[Tuple[str, int]]:
 
 
 def load_image(path: str, img_size: int = 224) -> np.ndarray:
-    """Load one image → (3, H, W) float32, ImageNet normalised."""
     from PIL import Image
     try:
         img = Image.open(path).convert('RGB')
@@ -152,14 +123,6 @@ class PACSDataset(Dataset):
 # =============================================================================
 
 class FrozenResNet18WithDropout(nn.Module):
-    """
-    Frozen ImageNet ResNet-18 backbone with:
-      - Dropout(p) on penultimate features (for stochastic passes)
-      - Trainable linear head (for Laplace approximation)
-
-    Call model.train() to activate dropout during inference.
-    Backbone parameters are always frozen (requires_grad=False).
-    """
     def __init__(self, num_classes: int = 7, p_drop: float = 0.15):
         super().__init__()
         base = tvm.resnet18(weights=tvm.ResNet18_Weights.IMAGENET1K_V1)
@@ -178,7 +141,6 @@ class FrozenResNet18WithDropout(nn.Module):
         return self.head(feats)              # (B, C)
 
     def get_features(self, x: torch.Tensor) -> torch.Tensor:
-        """Return post-dropout features without the head."""
         feats = self.backbone(x).flatten(1)
         return self.drop(feats)
 
@@ -188,10 +150,6 @@ def extract_features_single(
     model: FrozenResNet18WithDropout,
     device: str,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Single deterministic pass (dropout OFF) for MMD feature means.
-    Returns (feats: N×512, labels: N).
-    """
     model.eval()
     all_feats, all_labels = [], []
     with torch.no_grad():
@@ -208,25 +166,6 @@ def extract_credal_ellipsoid(
     device: str,
     H: int = 5,
 ) -> Dict:
-    """
-    Run H stochastic forward passes (dropout ON) through frozen backbone.
-    Compute the credal ellipsoid diagonal Σ_epi(x) for each instance.
-
-    This is the PRIMARY ε estimator. It lives in feature space (D=512),
-    exactly where MMD lives, so no bridging argument is needed.
-
-    Theory connection (Route A, §4 of paper):
-      C(x) = {h : (h−μ)ᵀ Σ_epi⁻¹ (h−μ) ≤ 1}
-      C(x) ⊆ B_ε(μ(x))  with  ε(x) = sqrt(mean_d σ²_d(x))
-      [Mukherjee et al. 2026, Prop. 1]
-
-    Returns:
-      mu        : (N, 512)  mean feature per instance
-      sigma_sq  : (N, 512)  per-dimension variance  ← Σ_epi diagonal
-      eps_per   : (N,)      per-instance ε = sqrt(mean_d σ²_d)
-      eps_domain: scalar    mean ε over target domain
-      mmi       : scalar    2 · max_d sqrt(mean_n σ²_d(x))
-    """
     # Activate dropout, freeze BN at running stats
     model.train()
     for m in model.modules():
@@ -290,10 +229,6 @@ def train_head(
     epochs: int = 15,
     lr: float = 1e-3,
 ) -> None:
-    """
-    Train the linear head on source features.
-    Laplace needs a MAP estimate to expand around.
-    """
     head.train()
     optimizer = torch.optim.Adam(head.parameters(), lr=lr, weight_decay=1e-4)
     criterion = nn.CrossEntropyLoss()
@@ -301,16 +236,12 @@ def train_head(
     dataset = TensorDataset(src_feats.to(device), src_labels.to(device))
     loader  = DataLoader(dataset, batch_size=256, shuffle=True)
 
-    for epoch in range(epochs):
-        epoch_loss = 0.0
+    for _ in range(epochs):
         for x, y in loader:
             optimizer.zero_grad()
             loss = criterion(head(x), y)
             loss.backward()
             optimizer.step()
-            epoch_loss += loss.item()
-        if (epoch + 1) % 5 == 0:
-            print(f"    Epoch {epoch+1}/{epochs}  loss={epoch_loss/len(loader):.4f}")
 
     head.eval()
 
@@ -326,28 +257,6 @@ def fit_and_query_laplace(
     tgt_feats: torch.Tensor,
     device: str = 'cpu',
 ) -> Dict:
-    """
-    Fit diagonal Laplace on the linear head, query on target features.
-
-    API notes:
-    - weight_subset='all': the model IS a single Linear layer;
-      'last_layer' requires laplace-torch's feature extractor hook which
-      fails on bare Linear modules. 'all' is identical here.
-    - hessian_structure='diag': 'kron' requires multi-layer structure
-      and crashes on single-layer models.
-    - dummy wrapper: laplace-torch requires len(list(model.modules())) > 2.
-
-    ε normalisation:
-    - Raw GLM predictive variance is in logit units (unbounded).
-    - We normalise via sigmoid(logit_std − median(logit_std)).
-    - This keeps ε ∈ (0,1) and is ROBUST to the overfitting level of the
-      MAP estimate: the median domain always maps to ε≈0.5 regardless of
-      absolute variance scale. The relative ordering — which is what drives
-      the (1−ε)·MMD discount — is preserved.
-    - WARNING: if head_epochs is too high (>20), the MAP estimate overfits
-      and logit variances inflate uniformly, compressing the spread. Use
-      head_epochs=15 (default) for best differential signal.
-    """
     head = head.to(device)
     dummy = nn.Sequential(nn.Identity(), nn.Identity(), head)
 
@@ -400,25 +309,12 @@ def compute_mmd_linear(
     mu_sources: List[torch.Tensor],
     mu_target: torch.Tensor,
 ) -> float:
-    """
-    Linear kernel MMD: ||mean(source features) - mean(target features)||_2.
-    mu_sources: list of (N_m, 512) feature tensors, one per source domain.
-    mu_target:  (N_t, 512) feature tensor.
-    """
     mu_s = torch.cat(mu_sources, dim=0).mean(dim=0)  # (512,)
     mu_t = mu_target.mean(dim=0)                      # (512,)
     return (mu_s - mu_t).norm().item()
 
 
 def compute_mmi_from_laplace(f_var: torch.Tensor) -> float:
-    """
-    MMI = 2 * max_c sqrt(mean_n f_var[n, c]).
-    Analogous to 2 * max_d sigma_d from feature-space dropout,
-    but over class dimensions (logit space) from Laplace.
-
-    This is a proxy MMI. For exact feature-space MMI you need
-    per-dimension dropout variance (see architecture discussion).
-    """
     per_class_std = f_var.mean(dim=0).sqrt()          # (C,)
     return (2.0 * per_class_std.max()).item()
 
@@ -434,29 +330,16 @@ def run_experiment(
     device: str,
     H: int = 5,
 ) -> Dict:
-    """
-    Leave-one-domain-out experiment using credal ellipsoid ε.
-
-    For each held-out domain:
-      1. Extract deterministic features for all domains → MMD
-      2. Run H stochastic passes on target domain → Σ_epi, ε, MMI
-      3. Compute (1−ε)·MMD certificate
-
-    No head training required. No Laplace. Pure feature-space geometry.
-    """
     records = []
 
     # Step 1: extract deterministic features for all domains (for MMD)
-    print("  Extracting deterministic features for MMD...")
     det_feats = {}
     for d in DOMAINS:
         feats, labels = extract_features_single(domain_loaders[d], model, device)
         det_feats[d] = (feats, labels)
-        print(f"    [{d}] {feats.shape}")
 
     # Step 2: LODO loop
     for held_out in DOMAINS:
-        print(f"\n--- Held-out: {held_out} ---")
         source_domains = [d for d in DOMAINS if d != held_out]
 
         # MMD: deterministic source mean vs deterministic target mean
@@ -466,7 +349,6 @@ def run_experiment(
         )
 
         # Credal ellipsoid: H stochastic passes on target only
-        print(f"  Computing credal ellipsoid (H={H} passes)...")
         credal = extract_credal_ellipsoid(
             domain_loaders[held_out], model, device, H=H
         )
@@ -475,11 +357,6 @@ def run_experiment(
         cert = (1.0 - eps) * mmd
 
         true_acc = held_out_acc.get(held_out, 0.0)
-        print(
-            f"  acc={true_acc:.1f}%  "
-            f"ε={eps:.3f}  mmd={mmd:.3f}  "
-            f"(1−ε)·MMD={cert:.3f}  MMI={mmi:.3f}"
-        )
 
         records.append({
             'domain':   held_out,
@@ -504,21 +381,7 @@ def run_experiment(
 
     rho_iipm, p_iipm = rho_cert, p_cert
 
-    print(f"\n{'─'*55}")
-    print(f"  {'Measure':<22}  {'ρ':>6}   {'p':>6}")
-    print(f"{'─'*55}")
-    for label, rho, p in [
-        ('MMD (baseline)',      rho_mmd,  p_mmd),
-        ('(1−ε)·MMD  [cert]',  rho_cert, p_cert),
-        ('MMI',                rho_mmi,  p_mmi),
-        ('ε (credal)',         rho_eps,  p_eps),
-    ]:
-        print(f"  {label:<22}  {rho:+.3f}   {p:.3f}")
-    print(f"{'─'*55}")
-
     confirmed = abs(rho_cert) > abs(rho_mmd)
-    print(f"\n  Hypothesis confirmed: {confirmed}")
-    print(f"  (|ρ_cert|={abs(rho_cert):.3f}  >  |ρ_mmd|={abs(rho_mmd):.3f})")
 
     return {
         'records':   records,
@@ -536,10 +399,6 @@ def run_experiment(
 # =============================================================================
 
 def plot_scatter(results: Dict, output_path: str) -> None:
-    """
-    Scatter: (1-ε)·MMD vs MMD as predictors of held-out accuracy.
-    Steeper negative slope for cert = hypothesis confirmed.
-    """
     records = results['records']
     accs    = np.array([r['accuracy'] for r in records])
 
@@ -580,7 +439,7 @@ def plot_scatter(results: Dict, output_path: str) -> None:
     ax.set_xlim(-0.1, 1.3)
     ax.set_xlabel("Normalised distance  (↑ = more shift)", fontsize=11)
     ax.set_ylabel("Held-out domain accuracy (%)", fontsize=11)
-    status = "confirmed ✓" if results['confirmed'] else "not confirmed ✗"
+    status = "confirmed" if results['confirmed'] else "not confirmed"
     ax.set_title(
         f"PACS: (1−ε)·MMD vs raw MMD  —  {status}",
         fontsize=10, pad=8,
@@ -591,15 +450,9 @@ def plot_scatter(results: Dict, output_path: str) -> None:
     plt.tight_layout()
     plt.savefig(output_path, bbox_inches='tight', dpi=150)
     plt.close()
-    print(f"  Saved: {output_path}")
 
 
 def plot_triangle(results: Dict, output_path: str) -> None:
-    """
-    Bar chart: MMD / (1-ε)·MMD / MMI per domain, sorted by accuracy.
-    Overlaid with ERM accuracy as a line.
-    All three measures should rank domains consistently.
-    """
     records = sorted(results['records'], key=lambda r: r['accuracy'])
     labels  = [r['domain'].replace('_', '\n') for r in records]
     accs    = [r['accuracy'] for r in records]
@@ -644,7 +497,6 @@ def plot_triangle(results: Dict, output_path: str) -> None:
     plt.tight_layout()
     plt.savefig(output_path, bbox_inches='tight', dpi=150)
     plt.close()
-    print(f"  Saved: {output_path}")
 
 
 # =============================================================================
@@ -690,15 +542,924 @@ def write_latex_table(results: Dict, output_path: str) -> None:
     ]
 
     Path(output_path).write_text('\n'.join(lines))
-    print(f"  Saved: {output_path}")
 
 
 # =============================================================================
-# MAIN
+# UNIFIED MPS PIPELINE  (credal_dg_mps — NeurIPS 2026 Kernel IIPM paper)
+#   Domain-structured folders: data_root /<domain>/<class>/*.{jpg,png,...}
+#   Run:  python credal_dg.py mps --exp e1 --dataset pacs --data_root ...
 # =============================================================================
+
+_IMG_EXTS_MPS = {'.jpg', '.jpeg', '.png', '.JPEG', '.JPG'}
+
+GT_ACC_MPS = {
+    'pacs': {
+        'art_painting': 84.7,
+        'cartoon':      80.8,
+        'photo':        97.2,
+        'sketch':       79.3,
+    },
+    'officehome': {
+        'Art':        61.3,
+        'Clipart':    52.4,
+        'Product':    75.8,
+        'Real_World': 76.6,
+    },
+    'cifar10c': {},
+}
+
+N_CLASSES_MPS = {
+    'pacs':       7,
+    'officehome': 65,
+    'domainnet':  345,
+    'cifar10c':   10,
+    'iwildcam':   182,
+}
+
+E3_HEAD_EPOCHS = [1, 3, 5, 10, 15, 20]
+E3_DROPOUT_P = [0.05, 0.10, 0.15, 0.20, 0.30]
+ENSEMBLE_SEEDS = [0, 1, 2, 3]
+
+_MPS_MEAN = [0.485, 0.456, 0.406]
+_MPS_STD = [0.229, 0.224, 0.225]
+transform_eval_mps = TVT.Compose([
+    TVT.Resize(256),
+    TVT.CenterCrop(224),
+    TVT.ToTensor(),
+    TVT.Normalize(_MPS_MEAN, _MPS_STD),
+])
+
+
+class DomainDatasetMPS(Dataset):
+    def __init__(self, domain_dir: Path, n: Optional[int] = None, seed: int = 42):
+        paths = [p for p in sorted(domain_dir.rglob('*')) if p.suffix in _IMG_EXTS_MPS]
+        if n is not None and n < len(paths):
+            rng = np.random.default_rng(seed)
+            paths = rng.choice(paths, n, replace=False).tolist()
+        self.paths = paths
+
+    def __len__(self):
+        return len(self.paths)
+
+    def __getitem__(self, i):
+        img = PILImage.open(self.paths[i]).convert('RGB')
+        return transform_eval_mps(img)
+
+
+def build_frozen_resnet18_mps() -> Tuple[nn.Module, nn.Linear]:
+    base = tv_models.resnet18(weights=tv_models.ResNet18_Weights.IMAGENET1K_V1)
+    features = nn.Sequential(*list(base.children())[:-1])
+    head = base.fc
+    for p in features.parameters():
+        p.requires_grad_(False)
+    return features, head
+
+
+def _enable_dropout_only_mps(model: nn.Module) -> None:
+    model.train()
+    for m in model.modules():
+        if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
+            m.eval()
+
+
+class EpsEstimator(ABC):
+    @abstractmethod
+    def estimate(self, loader: DataLoader, device: str) -> dict:
+        ...
+
+    @staticmethod
+    def _pack(mu: torch.Tensor, sigma: torch.Tensor, D: int) -> dict:
+        eps = (sigma.pow(2).mean(dim=1).sqrt() / math.sqrt(D)).clamp(1e-6, 1 - 1e-6)
+        mmi = 2.0 * sigma.max(dim=1).values
+        return {'mu': mu, 'sigma': sigma, 'eps': eps, 'mmi': mmi}
+
+
+class MCDropoutEstimator(EpsEstimator):
+    def __init__(self, H: int = 5, p: float = 0.15):
+        self.H = H
+        self.p = p
+
+    def estimate(self, loader: DataLoader, device: str) -> dict:
+        features, _ = build_frozen_resnet18_mps()
+        dropout = nn.Dropout(p=self.p)
+        backbone = nn.Sequential(features, nn.Flatten(), dropout).to(device)
+        _enable_dropout_only_mps(backbone)
+
+        all_mu, all_sigma = [], []
+        with torch.no_grad():
+            for batch in loader:
+                x = batch.to(device)
+                passes = torch.stack([backbone(x) for _ in range(self.H)], dim=1)
+                all_mu.append(passes.mean(1).cpu())
+                all_sigma.append(passes.std(1).cpu())
+
+        mu = torch.cat(all_mu, dim=0)
+        sigma = torch.cat(all_sigma, dim=0)
+        D = mu.shape[1]
+        return self._pack(mu, sigma, D)
+
+
+class LaplaceEstimatorMPS(EpsEstimator):
+    def estimate(self, loader: DataLoader, device: str) -> dict:
+        from laplace import Laplace
+
+        base = tv_models.resnet18(
+            weights=tv_models.ResNet18_Weights.IMAGENET1K_V1
+        ).to(device).eval()
+        for name, p in base.named_parameters():
+            if 'fc' not in name:
+                p.requires_grad_(False)
+
+        la = Laplace(
+            base,
+            likelihood='classification',
+            subset_of_weights='last_layer',
+            hessian_structure='diag',
+        )
+
+        pseudo_data = []
+        with torch.no_grad():
+            for batch in loader:
+                x = batch.to(device)
+                out = base(x)
+                y = out.argmax(1)
+                pseudo_data.append((x.cpu(), y.cpu()))
+
+        class PseudoDS(Dataset):
+            def __init__(self, data):
+                self.x = torch.cat([d[0] for d in data])
+                self.y = torch.cat([d[1] for d in data])
+
+            def __len__(self):
+                return len(self.x)
+
+            def __getitem__(self, i):
+                return self.x[i], self.y[i]
+
+        pseudo_ldr = DataLoader(PseudoDS(pseudo_data), batch_size=64, shuffle=False)
+        la.fit(pseudo_ldr)
+        la.optimize_prior_precision(method='marglik')
+
+        post_var = la.posterior_variance
+        D_feat = base.fc.in_features
+        K_out = base.fc.out_features
+        var_W = post_var.reshape(K_out, D_feat)
+        var_per_feat = var_W.mean(0)
+
+        feat_extractor = nn.Sequential(
+            *list(base.children())[:-1], nn.Flatten()
+        ).to(device).eval()
+
+        all_mu = []
+        with torch.no_grad():
+            for batch in loader:
+                x = batch.to(device)
+                all_mu.append(feat_extractor(x).cpu())
+
+        mu = torch.cat(all_mu, dim=0)
+        sigma = var_per_feat.sqrt().unsqueeze(0).expand_as(mu)
+
+        return self._pack(mu, sigma, D_feat)
+
+
+class DeepEnsembleEstimator(EpsEstimator):
+    def __init__(self, seeds: Optional[List[int]] = None):
+        self.seeds = seeds or ENSEMBLE_SEEDS
+
+    def estimate(self, loader: DataLoader, device: str) -> dict:
+        all_passes = []
+        for seed in self.seeds:
+            torch.manual_seed(seed)
+            base = tv_models.resnet18(
+                weights=tv_models.ResNet18_Weights.IMAGENET1K_V1
+            )
+            nn.init.kaiming_normal_(base.fc.weight, nonlinearity='relu')
+            nn.init.zeros_(base.fc.bias)
+            extractor = nn.Sequential(
+                *list(base.children())[:-1], nn.Flatten()
+            ).to(device).eval()
+
+            member_feats = []
+            with torch.no_grad():
+                for batch in loader:
+                    x = batch.to(device)
+                    member_feats.append(extractor(x).cpu())
+            all_passes.append(torch.cat(member_feats, dim=0))
+
+        passes = torch.stack(all_passes, dim=1)
+        mu = passes.mean(1)
+        sigma = passes.std(1)
+        D = mu.shape[1]
+        return self._pack(mu, sigma, D)
+
+
+def compute_certificate_mps(
+    source_feats: dict,
+    target_feats: dict,
+    K: int,
+    head: Optional[nn.Linear] = None,
+) -> dict:
+    mu_S = source_feats['mu'].mean(0)
+    mu_T = target_feats['mu'].mean(0)
+
+    mmd = (mu_S - mu_T).norm().item()
+    eps_S = source_feats['eps'].mean().item()
+    eps_T = target_feats['eps'].mean().item()
+    eps = max(eps_S, eps_T)
+    cert = (1.0 - eps) * mmd
+    mmi = target_feats['mmi'].mean().item()
+
+    out = {
+        'mmd': mmd, 'eps_S': eps_S, 'eps_T': eps_T,
+        'eps': eps, 'cert': cert, 'mmi': mmi,
+    }
+
+    if head is not None:
+        W = head.weight.detach().float().cpu()
+        B = torch.linalg.matrix_norm(W, ord=2).item()
+        full_cert = B * cert
+        non_vacuous = full_cert < math.log(K)
+        out.update({
+            'B': B, 'full_cert': full_cert,
+            'log_K': math.log(K), 'non_vacuous': non_vacuous,
+        })
+
+    return out
+
+
+def run_e1_mps(
+    dataset: str,
+    data_root: Path,
+    estimators: Dict[str, EpsEstimator],
+    device: str,
+    n_per_domain: int = 400,
+    batch: int = 64,
+    seed: int = 42,
+) -> dict:
+    domains = sorted([d.name for d in data_root.iterdir() if d.is_dir()])
+    K = N_CLASSES_MPS.get(dataset, 10)
+    gt = GT_ACC_MPS.get(dataset, {})
+    _, head = build_frozen_resnet18_mps()
+
+    results = {name: {} for name in estimators}
+    cache = {}
+
+    for est_name, estimator in estimators.items():
+        cache[est_name] = {}
+
+        for dom in domains:
+            ds = DomainDatasetMPS(data_root / dom, n=n_per_domain, seed=seed)
+            ldr = _mps_loader(ds, batch)
+            feats = estimator.estimate(ldr, device)
+            cache[est_name][dom] = feats
+
+        for target in domains:
+            sources = [d for d in domains if d != target]
+            pool = {
+                'mu': torch.cat([cache[est_name][d]['mu'] for d in sources]),
+                'eps': torch.cat([cache[est_name][d]['eps'] for d in sources]),
+            }
+            cert = compute_certificate_mps(pool, cache[est_name][target], K=K, head=head)
+            cert['acc'] = gt.get(target, None)
+            results[est_name][target] = cert
+
+    return results
+
+
+def _mps_loader(ds: Dataset, batch: int) -> DataLoader:
+    return DataLoader(ds, batch_size=batch, shuffle=False, num_workers=0, pin_memory=False)
+
+
+def run_e3_mps(
+    data_root: Path,
+    target_domain: str,
+    device: str,
+    n: int = 400,
+    batch: int = 64,
+    seed: int = 42,
+) -> dict:
+    domains = sorted([d.name for d in data_root.iterdir() if d.is_dir()])
+    sources = [d for d in domains if d != target_domain]
+    gt = GT_ACC_MPS.get('pacs', {})
+    K = N_CLASSES_MPS['pacs']
+
+    class CombinedDS(Dataset):
+        def __init__(self, dirs: List[Path]):
+            self.samples = []
+            classes = set()
+            for d in dirs:
+                for cls_dir in sorted(d.iterdir()):
+                    if cls_dir.is_dir():
+                        classes.add(cls_dir.name)
+            self.class_to_idx = {c: i for i, c in enumerate(sorted(classes))}
+            for d in dirs:
+                for cls_dir in sorted(d.iterdir()):
+                    if not cls_dir.is_dir():
+                        continue
+                    label = self.class_to_idx[cls_dir.name]
+                    for img_path in cls_dir.rglob('*'):
+                        if img_path.suffix in _IMG_EXTS_MPS:
+                            self.samples.append((img_path, label))
+
+        def __len__(self):
+            return len(self.samples)
+
+        def __getitem__(self, i):
+            path, label = self.samples[i]
+            return transform_eval_mps(PILImage.open(path).convert('RGB')), label
+
+    source_ds = CombinedDS([data_root / d for d in sources])
+    source_ldr = DataLoader(
+        source_ds, batch_size=batch, shuffle=True, num_workers=0, pin_memory=False,
+    )
+
+    target_ds = DomainDatasetMPS(data_root / target_domain, n=n, seed=seed)
+    target_ldr = _mps_loader(target_ds, batch)
+
+    grid = {}
+
+    for epoch, p in product(E3_HEAD_EPOCHS, E3_DROPOUT_P):
+        base = tv_models.resnet18(
+            weights=tv_models.ResNet18_Weights.IMAGENET1K_V1
+        ).to(device)
+        for name, param in base.named_parameters():
+            if 'fc' not in name:
+                param.requires_grad_(False)
+
+        n_classes = len(source_ds.class_to_idx)
+        base.fc = nn.Linear(512, n_classes).to(device)
+
+        opt = torch.optim.SGD(base.fc.parameters(), lr=1e-3, momentum=0.9)
+        loss_fn = nn.CrossEntropyLoss()
+
+        base.train()
+        for _ in range(epoch):
+            for xb, yb in source_ldr:
+                xb, yb = xb.to(device), yb.to(device)
+                opt.zero_grad()
+                loss_fn(base(xb), yb).backward()
+                opt.step()
+
+        extractor = nn.Sequential(
+            *list(base.children())[:-1], nn.Flatten(),
+            nn.Dropout(p=p),
+        ).to(device)
+
+        domain_feats = {}
+        for dom in domains:
+            ds = DomainDatasetMPS(data_root / dom, n=n, seed=seed)
+            ldr = _mps_loader(ds, batch)
+            _enable_dropout_only_mps(extractor)
+
+            all_mu, all_sigma = [], []
+            with torch.no_grad():
+                for xb in ldr:
+                    xb = xb.to(device)
+                    passes = torch.stack([extractor(xb) for _ in range(5)], dim=1)
+                    all_mu.append(passes.mean(1).cpu())
+                    all_sigma.append(passes.std(1).cpu())
+
+            mu = torch.cat(all_mu)
+            sigma = torch.cat(all_sigma)
+            D = mu.shape[1]
+            eps = (sigma.pow(2).mean(1).sqrt() / math.sqrt(D)).clamp(1e-6, 1 - 1e-6)
+            mmi = 2.0 * sigma.max(1).values
+            domain_feats[dom] = {'mu': mu, 'sigma': sigma, 'eps': eps, 'mmi': mmi}
+
+        pool = {
+            'mu': torch.cat([domain_feats[d]['mu'] for d in sources]),
+            'eps': torch.cat([domain_feats[d]['eps'] for d in sources]),
+        }
+        cert = compute_certificate_mps(
+            pool, domain_feats[target_domain],
+            K=K, head=base.fc,
+        )
+
+        grid.setdefault(epoch, {})[p] = cert
+
+    return grid
+
+
+def run_e4_mps(
+    dataset: str,
+    data_root: Path,
+    estimator: EpsEstimator,
+    device: str,
+    n_per_domain: int = 400,
+    batch: int = 64,
+    seed: int = 42,
+) -> dict:
+    if dataset == 'domainnet':
+        return run_e1_mps(
+            dataset=dataset,
+            data_root=data_root,
+            estimators={'dropout': estimator},
+            device=device,
+            n_per_domain=n_per_domain,
+            batch=batch,
+            seed=seed,
+        )
+
+    if dataset == 'iwildcam':
+        try:
+            from wilds import get_dataset
+            get_dataset('iwildcam', root_dir=str(data_root), download=False)
+        except ImportError as e:
+            raise ImportError('pip install wilds') from e
+        raise NotImplementedError(
+            'Use WILDS pipeline: python credal_dg.py wilds --dataset iwildcam --data_root ...'
+        )
+
+    raise ValueError(f'Unknown dataset for E4: {dataset}')
+
+
+DEFAULT_MPS_ROOTS = {
+    'pacs':       Path('./data/pacs_data'),
+    'officehome': Path('./data/OfficeHome'),
+    'cifar10c':   Path('./data/CIFAR-10-C'),
+    'domainnet':  Path('./data/DomainNet'),
+    'iwildcam':   Path('./data/wilds'),
+}
+
+
+def build_estimators_mps(choice: str) -> Dict[str, EpsEstimator]:
+    if choice == 'dropout':
+        return {'dropout': MCDropoutEstimator(H=5, p=0.15)}
+    if choice == 'laplace':
+        return {'laplace': LaplaceEstimatorMPS()}
+    if choice == 'ensemble':
+        return {'ensemble': DeepEnsembleEstimator(seeds=ENSEMBLE_SEEDS)}
+    if choice == 'all':
+        return {
+            'dropout': MCDropoutEstimator(H=5, p=0.15),
+            'laplace': LaplaceEstimatorMPS(),
+            'ensemble': DeepEnsembleEstimator(seeds=ENSEMBLE_SEEDS),
+        }
+    raise ValueError(choice)
+
+
+def parse_args_mps():
+    p = argparse.ArgumentParser(description='Unified credal DG / Kernel IIPM experiments')
+    p.add_argument('--exp', choices=['e1', 'e3', 'e4'], default='e1')
+    p.add_argument(
+        '--dataset', default='pacs',
+        choices=['pacs', 'officehome', 'cifar10c', 'domainnet', 'iwildcam'],
+    )
+    p.add_argument('--data_root', type=Path, default=None,
+                   help='Root with one subdir per domain (ImageFolder layout)')
+    p.add_argument('--estimator', default='dropout',
+                   choices=['dropout', 'laplace', 'ensemble', 'all'])
+    p.add_argument('--device', default='auto',
+                   choices=['auto', 'cpu', 'cuda', 'mps'])
+    p.add_argument('--n', type=int, default=400, help='Instances per domain')
+    p.add_argument('--batch', type=int, default=64)
+    p.add_argument('--seed', type=int, default=42)
+    p.add_argument('--target', default='sketch', help='Target domain for E3')
+    p.add_argument('--out_dir', type=Path, default=Path('results'))
+    return p.parse_args()
+
+
+def _jsonify_mps(obj):
+    if isinstance(obj, torch.Tensor):
+        return obj.tolist()
+    if isinstance(obj, dict):
+        return {k: _jsonify_mps(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_jsonify_mps(v) for v in obj]
+    if isinstance(obj, Path):
+        return str(obj)
+    if isinstance(obj, (np.floating, np.integer)):
+        return float(obj) if isinstance(obj, np.floating) else int(obj)
+    return obj
+
+
+def main_mps():
+    args = parse_args_mps()
+    data_root = args.data_root or DEFAULT_MPS_ROOTS[args.dataset]
+    args.out_dir.mkdir(parents=True, exist_ok=True)
+    device = pick_device(args.device)
+
+    if args.exp == 'e1':
+        estimators = build_estimators_mps(args.estimator)
+        results = run_e1_mps(
+            dataset=args.dataset,
+            data_root=data_root,
+            estimators=estimators,
+            device=device,
+            n_per_domain=args.n,
+            batch=args.batch,
+            seed=args.seed,
+        )
+        tag = f'e1_{args.dataset}_{args.estimator}'
+
+    elif args.exp == 'e3':
+        results = run_e3_mps(
+            data_root=data_root,
+            target_domain=args.target,
+            device=device,
+            n=args.n,
+            batch=args.batch,
+            seed=args.seed,
+        )
+        tag = f'e3_{args.dataset}_target-{args.target}'
+
+    elif args.exp == 'e4':
+        est = build_estimators_mps(args.estimator)
+        estimator = list(est.values())[0]
+        results = run_e4_mps(
+            dataset=args.dataset,
+            data_root=data_root,
+            estimator=estimator,
+            device=device,
+            n_per_domain=args.n,
+            batch=args.batch,
+            seed=args.seed,
+        )
+        tag = f'e4_{args.dataset}_{args.estimator}'
+
+    else:
+        raise ValueError(args.exp)
+
+    out_path = args.out_dir / f'{tag}.json'
+    with open(out_path, 'w') as f:
+        json.dump(_jsonify_mps(results), f, indent=2)
+
+
+# =============================================================================
+# WILDS pipeline  (wilds_credal_dg — NeurIPS 2026)
+#   python credal_dg.py wilds --dataset iwildcam --data_root /Users/.../data/wilds
+# =============================================================================
+
+GT_ACC_WILDS = {
+    'camelyon17': {
+        0: 93.2,
+        1: 85.6,
+        2: 91.4,
+        3: 70.3,
+        4: 88.9,
+    },
+    'fmow': {
+        'Africa':   32.3,
+        'Americas': 48.7,
+        'Oceania':  51.2,
+        'Asia':     55.6,
+        'Europe':   59.1,
+    },
+    'iwildcam': {},
+}
+
+N_CLASSES_WILDS = {
+    'iwildcam':   182,
+    'camelyon17': 2,
+    'fmow':       62,
+}
+
+DOMAIN_COL_WILDS = {
+    'iwildcam':   0,
+    'camelyon17': 0,
+    'fmow':       0,
+}
+
+FMOW_REGION_NAMES = {
+    0: 'Africa', 1: 'Americas', 2: 'Oceania', 3: 'Asia', 4: 'Europe',
+}
+
+transform_eval_wilds = TVT.Compose([
+    TVT.Resize(256),
+    TVT.CenterCrop(224),
+    TVT.ToTensor(),
+    TVT.Normalize(_MPS_MEAN, _MPS_STD),
+])
+
+
+def build_backbone_wilds(n_classes: int, device: str) -> Tuple[nn.Module, nn.Linear]:
+    base = tv_models.resnet18(weights=tv_models.ResNet18_Weights.IMAGENET1K_V1)
+    extractor = nn.Sequential(*list(base.children())[:-1], nn.Flatten())
+    head = nn.Linear(512, n_classes)
+    nn.init.kaiming_normal_(head.weight)
+    nn.init.zeros_(head.bias)
+    for p in extractor.parameters():
+        p.requires_grad_(False)
+    extractor = extractor.to(device).eval()
+    head = head.to(device).eval()
+    return extractor, head
+
+
+def _enable_dropout_wilds(model: nn.Module, p: float) -> nn.Module:
+    net = nn.Sequential(model, nn.Dropout(p=p))
+    net.train()
+    for m in net.modules():
+        if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d)):
+            m.eval()
+    return net
+
+
+def wilds_collate_fn(batch):
+    xs = torch.stack([item[0] for item in batch])
+    ys = torch.tensor([item[1] for item in batch], dtype=torch.long)
+    return xs, ys
+
+
+class WILDSDomainSplitter:
+    def __init__(
+        self,
+        wilds_ds,
+        domain_col: int,
+        split: str = 'test',
+        n_per_domain: int = 200,
+        batch: int = 64,
+        seed: int = 42,
+    ):
+        self.wilds_ds = wilds_ds
+        self.domain_col = domain_col
+        self.n_per_domain = n_per_domain
+        self.batch = batch
+        self.rng = np.random.default_rng(seed)
+        self.split_ds = wilds_ds.get_subset(split, transform=transform_eval_wilds)
+        meta = self.split_ds.metadata_array
+        if hasattr(meta, 'numpy'):
+            self.domain_ids = meta[:, domain_col].numpy()
+        else:
+            self.domain_ids = np.asarray(meta[:, domain_col])
+        self.unique_domains = np.unique(self.domain_ids)
+
+    def get_domain_loader(self, domain_id) -> DataLoader:
+        did = int(domain_id)
+        idx = np.where(self.domain_ids == did)[0]
+        if len(idx) > self.n_per_domain:
+            idx = self.rng.choice(idx, self.n_per_domain, replace=False)
+        subset = Subset(self.split_ds, idx.tolist())
+        return DataLoader(
+            subset,
+            batch_size=self.batch,
+            shuffle=False,
+            num_workers=0,
+            pin_memory=False,
+            collate_fn=wilds_collate_fn,
+        )
+
+    def n_instances(self, domain_id) -> int:
+        did = int(domain_id)
+        return int((self.domain_ids == did).sum())
+
+
+@torch.no_grad()
+def extract_domain_feats_wilds(
+    loader: DataLoader,
+    extractor: nn.Module,
+    dropout_p: float = 0.15,
+    H: int = 5,
+    device: str = 'cpu',
+) -> dict:
+    net = _enable_dropout_wilds(extractor, p=dropout_p)
+    D = 512
+    all_mu, all_sigma = [], []
+    for batch in loader:
+        x = batch[0] if isinstance(batch, (list, tuple)) else batch
+        x = x.to(device)
+        passes = torch.stack([net(x) for _ in range(H)], dim=1)
+        all_mu.append(passes.mean(1).cpu())
+        all_sigma.append(passes.std(1).cpu())
+    mu = torch.cat(all_mu)
+    sigma = torch.cat(all_sigma)
+    eps = (sigma.pow(2).mean(1).sqrt() / math.sqrt(D)).clamp(1e-6, 1 - 1e-6)
+    mmi = 2.0 * sigma.max(1).values
+    return {'mu': mu, 'sigma': sigma, 'eps': eps, 'mmi': mmi}
+
+
+def compute_certificate_wilds(
+    source_pool: dict,
+    target_feats: dict,
+    K: int,
+    head: nn.Linear,
+) -> dict:
+    mu_S = source_pool['mu'].mean(0)
+    mu_T = target_feats['mu'].mean(0)
+    mmd = (mu_S - mu_T).norm().item()
+    eps_S = source_pool['eps'].mean().item()
+    eps_T = target_feats['eps'].mean().item()
+    eps = max(eps_S, eps_T)
+    cert = (1.0 - eps) * mmd
+    mmi = target_feats['mmi'].mean().item()
+    W = head.weight.detach().float().cpu()
+    B = torch.linalg.matrix_norm(W, ord=2).item()
+    full = B * cert
+    return {
+        'mmd': mmd, 'eps_S': eps_S, 'eps_T': eps_T, 'eps': eps,
+        'cert': cert, 'mmi': mmi,
+        'B': B, 'full_cert': full,
+        'log_K': math.log(K),
+        'non_vacuous': full < math.log(K),
+    }
+
+
+def compute_gt_from_val_wilds(
+    wilds_ds,
+    extractor: nn.Module,
+    head: nn.Linear,
+    domain_col: int,
+    n_per_domain: int,
+    batch: int,
+    device: str,
+    top_k_domains: int = 20,
+) -> dict:
+    splitter = WILDSDomainSplitter(
+        wilds_ds, domain_col, split='val',
+        n_per_domain=n_per_domain, batch=batch,
+    )
+    domain_sizes = {d: splitter.n_instances(d) for d in splitter.unique_domains}
+    top_domains = sorted(domain_sizes, key=domain_sizes.get, reverse=True)[:top_k_domains]
+
+    full_head = nn.Sequential(extractor, head).to(device).eval()
+    gt = {}
+    for dom in top_domains:
+        ldr = splitter.get_domain_loader(dom)
+        correct = 0
+        total = 0
+        with torch.no_grad():
+            for xb, yb in ldr:
+                xb = xb.to(device)
+                pred = full_head(xb).argmax(1).cpu()
+                correct += (pred == yb).sum().item()
+                total += len(yb)
+        if total > 0:
+            gt[int(dom)] = 100.0 * correct / total
+        else:
+            gt[int(dom)] = 0.0
+    return gt
+
+
+def run_wilds(
+    dataset: str,
+    data_root: Path,
+    device: str = 'cpu',
+    H: int = 5,
+    dropout_p: float = 0.15,
+    n_per_domain: int = 200,
+    batch: int = 64,
+    seed: int = 42,
+    max_domains: int = 30,
+    out_dir: Path = Path('results'),
+) -> dict:
+    from wilds import get_dataset
+
+    out_dir = Path(out_dir).expanduser().resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    K = N_CLASSES_WILDS[dataset]
+    domain_col = DOMAIN_COL_WILDS[dataset]
+
+    wilds_ds = get_dataset(dataset, root_dir=str(data_root), download=False)
+    extractor, head = build_backbone_wilds(K, device)
+
+    gt = {**GT_ACC_WILDS}
+    if dataset == 'iwildcam':
+        gt['iwildcam'] = compute_gt_from_val_wilds(
+            wilds_ds, extractor, head, domain_col,
+            n_per_domain=n_per_domain, batch=batch, device=device,
+            top_k_domains=max_domains,
+        )
+    gt_acc = gt[dataset]
+
+    test_splitter = WILDSDomainSplitter(
+        wilds_ds, domain_col, split='test',
+        n_per_domain=n_per_domain, batch=batch, seed=seed,
+    )
+    train_splitter = WILDSDomainSplitter(
+        wilds_ds, domain_col, split='train',
+        n_per_domain=n_per_domain, batch=batch, seed=seed,
+    )
+
+    if dataset == 'iwildcam':
+        eval_domains = [
+            d for d in test_splitter.unique_domains
+            if int(d) in gt_acc
+        ][:max_domains]
+    elif dataset == 'fmow':
+        eval_domains = list(range(5))
+    else:
+        eval_domains = list(range(5))
+
+    source_mus, source_eps = [], []
+    train_dom_list = train_splitter.unique_domains
+    if len(train_dom_list) > max_domains:
+        train_dom_list = train_dom_list[:max_domains]
+    for dom in train_dom_list:
+        ldr = train_splitter.get_domain_loader(dom)
+        feats = extract_domain_feats_wilds(ldr, extractor, dropout_p, H, device)
+        source_mus.append(feats['mu'])
+        source_eps.append(feats['eps'])
+
+    source_pool = {
+        'mu': torch.cat(source_mus),
+        'eps': torch.cat(source_eps),
+    }
+
+    results = {}
+    all_accs, all_mmds, all_certs, all_mmis = [], [], [], []
+    domain_feats_pt = {'source_pool': source_pool, 'targets': {}}
+
+    for dom in eval_domains:
+        dom_key = FMOW_REGION_NAMES.get(dom, int(dom)) if dataset == 'fmow' else int(dom)
+        acc = gt_acc.get(dom_key, gt_acc.get(int(dom), None))
+        if acc is None:
+            continue
+
+        ldr = test_splitter.get_domain_loader(dom)
+        feats = extract_domain_feats_wilds(ldr, extractor, dropout_p, H, device)
+        domain_feats_pt['targets'][str(dom_key)] = feats
+
+        cert = compute_certificate_wilds(source_pool, feats, K=K, head=head)
+        cert['acc'] = acc
+
+        results[str(dom_key)] = cert
+        all_accs.append(acc)
+        all_mmds.append(cert['mmd'])
+        all_certs.append(cert['cert'])
+        all_mmis.append(cert['mmi'])
+
+    if len(all_accs) >= 3:
+        rho_mmd, _ = spearmanr(all_accs, all_mmds)
+        rho_cert, _ = spearmanr(all_accs, all_certs)
+        rho_mmi, _ = spearmanr(all_accs, all_mmis)
+        results['__rho__'] = {
+            'mmd': float(rho_mmd),
+            'cert': float(rho_cert),
+            'mmi': float(rho_mmi),
+            'n_domains': len(all_accs),
+        }
+
+    def _jsonify_wilds(obj):
+        if isinstance(obj, torch.Tensor):
+            return float(obj) if obj.ndim == 0 else obj.tolist()
+        if isinstance(obj, np.ndarray):
+            return float(obj) if obj.ndim == 0 else obj.tolist()
+        if isinstance(obj, dict):
+            return {k: _jsonify_wilds(v) for k, v in obj.items()}
+        if isinstance(obj, (list, tuple)):
+            return [_jsonify_wilds(v) for v in obj]
+        if isinstance(obj, (np.integer, np.floating)):
+            return obj.item()
+        if isinstance(obj, (bool, str, int, float)) or obj is None:
+            return obj
+        return str(obj)
+
+    out_json = out_dir / f'{dataset}_wilds.json'
+    with open(out_json, 'w') as f:
+        json.dump(_jsonify_wilds(results), f, indent=2)
+
+    pt_path = out_dir / f'domain_feats_{dataset}.pt'
+    torch.save(domain_feats_pt, pt_path)
+
+    return results
+
+
+def parse_args_wilds():
+    p = argparse.ArgumentParser(description='WILDS credal DG (MC dropout ε, certificates)')
+    p.add_argument(
+        '--dataset', default='camelyon17',
+        choices=['iwildcam', 'camelyon17', 'fmow'],
+    )
+    p.add_argument(
+        '--data_root', type=Path, default=Path('./data/wilds'),
+        help='WILDS root_dir (download target). Example: /Users/you/research/data/wilds',
+    )
+    p.add_argument(
+        '--device', default='auto',
+        choices=['auto', 'cpu', 'cuda', 'mps'],
+    )
+    p.add_argument('--H', type=int, default=5)
+    p.add_argument('--dropout_p', type=float, default=0.15)
+    p.add_argument('--n_per_domain', type=int, default=200)
+    p.add_argument('--batch', type=int, default=64)
+    p.add_argument('--seed', type=int, default=42)
+    p.add_argument(
+        '--max_domains', type=int, default=30,
+        help='Cap train domains pooled; iWildCam test domains use GT overlap',
+    )
+    p.add_argument('--out_dir', type=Path, default=Path('results'))
+    return p.parse_args()
+
+
+def main_wilds():
+    args = parse_args_wilds()
+    data_root = Path(args.data_root).expanduser().resolve()
+    out_dir = Path(args.out_dir).expanduser().resolve()
+    device = pick_device(args.device)
+    run_wilds(
+        dataset=args.dataset,
+        data_root=data_root,
+        device=device,
+        H=args.H,
+        dropout_p=args.dropout_p,
+        n_per_domain=args.n_per_domain,
+        batch=args.batch,
+        seed=args.seed,
+        max_domains=args.max_domains,
+        out_dir=out_dir,
+    )
+
 
 def pick_device(requested: str) -> str:
-    """Resolve device. 'auto' prefers MPS > CUDA > CPU."""
     if requested != 'auto':
         return requested
     try:
@@ -743,21 +1504,17 @@ def main():
         raise FileNotFoundError(f"pacs_label/ not found at {label_root}")
 
     device = pick_device(args.device)
-    print(f"\nDevice: {device}  |  H={args.H}  |  dropout_p={args.dropout_p}"
-          f"  |  batch={args.batch_size}  |  img_size={args.img_size}")
 
     # ── Load samples ──────────────────────────────────────────────────────
     domain_samples = {}
     for domain in DOMAINS:
         label_file = label_root / f'{domain}_{args.split}_kfold.txt'
-        print(f"\n[{domain}] {label_file.name}")
         samples = parse_label_file(str(label_file), str(img_root))
         if args.max_samples and len(samples) > args.max_samples:
             rng = np.random.default_rng(42)
             idx = rng.choice(len(samples), size=args.max_samples, replace=False)
             samples = [samples[i] for i in idx]
         domain_samples[domain] = samples
-        print(f"  {len(samples)} instances.")
 
     # ── Build loaders (images stay on disk, loaded on demand) ─────────────
     # We keep loaders rather than cached tensors so extract_credal_ellipsoid
@@ -776,15 +1533,11 @@ def main():
     ).to(device)
 
     # ── Run LODO experiment ───────────────────────────────────────────────
-    print(f"\n{'='*55}")
-    print(f"  Leave-One-Domain-Out  (credal ellipsoid, H={args.H})")
-    print(f"{'='*55}")
     results = run_experiment(
         domain_loaders, model, ERM_ACC_PACS, device, H=args.H
     )
 
     # ── Figures ───────────────────────────────────────────────────────────
-    print("\nGenerating figures...")
     plot_scatter(results,  str(output_dir / 'fig_iipm_vs_mmd.pdf'))
     plot_triangle(results, str(output_dir / 'fig_dro_mmi_triangle.pdf'))
     write_latex_table(results, str(output_dir / 'table_latex.tex'))
@@ -802,9 +1555,15 @@ def main():
     (output_dir / 'results.json').write_text(
         json.dumps(to_python(results), indent=2)
     )
-    print(f"\nAll outputs in: {output_dir}/")
-    print("Done.")
 
 
 if __name__ == '__main__':
-    main()
+    import sys
+    if len(sys.argv) > 1 and sys.argv[1] == 'mps':
+        sys.argv.pop(1)
+        main_mps()
+    elif len(sys.argv) > 1 and sys.argv[1] == 'wilds':
+        sys.argv.pop(1)
+        main_wilds()
+    else:
+        main()
