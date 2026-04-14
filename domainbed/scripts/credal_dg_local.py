@@ -304,14 +304,16 @@ def mc_dropout_feats(loader, extractor, H):
     return {"mu": mu, "sigma": sigma, "eps": eps, "mmi": mmi}
 
 
-def compute_entropy_baseline(feats):
+def compute_entropy_baseline(feats, head):
     """
-    Predictive entropy of the ensemble mean as a baseline.
+    Predictive entropy of the class logits induced by the ensemble mean features.
     This is what the paper claims MMI outperforms.
-    H(BetP) = -sum_c p_c log p_c  where p = softmax(mu).
+    H(BetP) = -sum_c p_c log p_c  where p = softmax(head(mu)).
     """
     mu = feats["mu"].float()
-    p  = torch.softmax(mu, dim=-1)
+    with torch.no_grad():
+        logits = head(mu)
+    p  = torch.softmax(logits, dim=-1)
     return float(-(p * (p + 1e-8).log()).sum(-1).mean())
 
 
@@ -328,7 +330,7 @@ def compute_B(base, arch):
     return torch.linalg.matrix_norm(W, ord=2).item()
 
 
-def full_certificate(src_feats, tgt_feats, B, K):
+def full_certificate(src_feats, tgt_feats, B, K, head):
     """
     Compute all Q1/Q2/Q3 certificate quantities for one source→target pair.
 
@@ -353,7 +355,7 @@ def full_certificate(src_feats, tgt_feats, B, K):
     mmd     = (mu_S - mu_T).norm().item()
     route_a = (1.0 - eps) * mmd
     mmi     = 2.0 * sigma_T.max().item()
-    entropy = compute_entropy_baseline(tgt_feats)
+    entropy = compute_entropy_baseline(tgt_feats, head)
 
     log_K   = math.log(K)
     cert    = B * route_a
@@ -436,7 +438,11 @@ def run_lodo(root, dataset_name, K, arch="resnet18",
         tgt_feats  = mc_dropout_feats(tgt_loader, ext, H)
 
         # Compute certificate
-        cert = full_certificate(src_feats, tgt_feats, B, K)
+        if arch == "resnet18":
+            head = base.fc.cpu()
+        else:
+            head = base.heads.head.cpu()
+        cert = full_certificate(src_feats, tgt_feats, B, K, head)
         cert["domain"]  = target
         cert["gt_acc"]  = GT_ACC.get(target)
         cert["dataset"] = dataset_name

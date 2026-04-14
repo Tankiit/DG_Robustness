@@ -1,3 +1,4 @@
+import os
 import modal
 import math
 from itertools import product
@@ -41,6 +42,27 @@ N_DIRECTIONS  = 1024     # Monte Carlo directions for Hausdorff IIPM
 
 E3_EPOCHS     = [1, 3, 5, 10, 15, 20]
 E3_DROPS      = [0.05, 0.10, 0.15, 0.20, 0.30]
+
+DEFAULT_HF_ROOT = "/media/data/tanmoy"
+DEFAULT_HF_HUB_CACHE = f"{DEFAULT_HF_ROOT}/huggingface_hub"
+DEFAULT_HF_DATASETS_CACHE = f"{DEFAULT_HF_ROOT}/huggingface_datasets"
+
+
+def configure_hf_env() -> tuple[str, str, str]:
+    hf_root = os.environ.get("HF_HOME", DEFAULT_HF_ROOT)
+    hub_cache = os.environ.get("HF_HUB_CACHE", DEFAULT_HF_HUB_CACHE)
+    datasets_cache = os.environ.get("HF_DATASETS_CACHE", DEFAULT_HF_DATASETS_CACHE)
+
+    os.makedirs(hf_root, exist_ok=True)
+    os.makedirs(hub_cache, exist_ok=True)
+    os.makedirs(datasets_cache, exist_ok=True)
+
+    os.environ["HF_HOME"] = hf_root
+    os.environ["HF_HUB_CACHE"] = hub_cache
+    os.environ["HUGGINGFACE_HUB_CACHE"] = hub_cache
+    os.environ["HF_DATASETS_CACHE"] = datasets_cache
+
+    return hf_root, hub_cache, datasets_cache
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -131,23 +153,37 @@ HF = {
 # SECTION 1: DATA HELPERS
 # ─────────────────────────────────────────────────────────────────
 
-def get_all_domains(cfg: dict) -> list:
+def _hf_load_dataset(hf_id: str, split: str):
     from datasets import load_dataset
+
+    _, _, datasets_cache = configure_hf_env()
+    token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+
+    kwargs = {
+        "split": split,
+        "cache_dir": datasets_cache,
+    }
+    if token:
+        kwargs["token"] = token
+
+    return load_dataset(hf_id, **kwargs)
+
+def get_all_domains(cfg: dict) -> list:
     seen = set()
     for split_name in cfg["splits"]:
-        ds = load_dataset(cfg["hf_id"], split=split_name)
+        ds = _hf_load_dataset(cfg["hf_id"], split_name)
         seen.update(ds[cfg["domain_col"]])
     return sorted(seen)
 
 
 def get_domain_loader(cfg: dict, domain_val, transform,
                       n: int, seed: int, batch: int):
-    from datasets import load_dataset, concatenate_datasets
+    from datasets import concatenate_datasets
     from torch.utils.data import DataLoader, Dataset
 
     parts = []
     for split_name in cfg["splits"]:
-        ds = load_dataset(cfg["hf_id"], split=split_name)
+        ds = _hf_load_dataset(cfg["hf_id"], split_name)
         if cfg["domain_type"] == "int":
             ds = ds.filter(lambda x: x[cfg["domain_col"]] == int(domain_val))
         else:
@@ -198,10 +234,9 @@ def finetune_head(cfg: dict, source_domains: list,
                   base, device: str, transform_train, epochs: int):
     import torch
     import torch.nn as nn
-    from datasets import load_dataset
     from torch.utils.data import DataLoader, Dataset
 
-    ds_full = load_dataset(cfg["hf_id"], split=cfg["splits"][0])
+    ds_full = _hf_load_dataset(cfg["hf_id"], cfg["splits"][0])
     if cfg["domain_type"] == "int":
         sub = ds_full.filter(lambda x: x[cfg["domain_col"]] in source_domains)
     else:
@@ -271,12 +306,12 @@ def mc_dropout_feats(loader, extractor, H: int, device: str) -> dict:
     mu    = torch.cat(mus)              # (N, D)
     sigma = torch.cat(sigs)            # (N, D)
 
-    # ε(x) = sqrt(mean_d σ²_d(x)) / sqrt(D)
-    eps   = (sigma.pow(2).mean(1).sqrt() / math.sqrt(D)).clamp(1e-6, 1 - 1e-6)
+    # Canonical ε(x) = sqrt(mean_d σ²_d(x))
+    eps   = sigma.pow(2).mean(1).sqrt().clamp(1e-6, 1 - 1e-6)
     # MMI(x) = 2·max_d σ_d(x)   [Corollary 5, linear kernel]
     mmi   = 2.0 * sigma.max(1).values
 
-    return {"mu": mu, "sigma": sigma, "eps": eps, "mmi": mmi}
+    return {"mu": mu, "sigma": sigma, "eps": eps, "epsilon": eps, "mmi": mmi}
 
 
 def compute_per_instance_loss(loader, base, device: str) -> "torch.Tensor":
@@ -616,6 +651,26 @@ def run_hf(dataset: str):
     return results
 
 
+@app.function(
+    gpu="A100",
+    timeout=60 * 180,
+    volumes={RESULTS: results_vol},
+    secrets=[hf_secret],
+)
+def run_domainnet():
+    return run_hf.local("domainnet")
+
+
+@app.function(
+    gpu="A100",
+    timeout=60 * 150,
+    volumes={RESULTS: results_vol},
+    secrets=[hf_secret],
+)
+def run_officehome():
+    return run_hf.local("officehome")
+
+
 # ─────────────────────────────────────────────────────────────────
 # SECTION 8: E3 STABILITY GRID
 # head_epochs × dropout_p — 30 cells, sequential on same GPU
@@ -643,7 +698,7 @@ def e3_cell(epoch: int, p_drop: float, target: str = "sketch"):
         T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
     ])
 
-    ds      = load_dataset(cfg["hf_id"], split=cfg["splits"][0])
+    ds      = _hf_load_dataset(cfg["hf_id"], cfg["splits"][0])
     domains = sorted(set(ds[cfg["domain_col"]]))
     sources = [d for d in domains if d != target]
 
@@ -706,7 +761,7 @@ def e3(target: str = "sketch"):
     secrets=[hf_secret],
 )
 def run_gpu1():
-    return run_hf.local("domainnet")
+    return run_domainnet.local()
 
 
 @app.function(
@@ -716,7 +771,7 @@ def run_gpu1():
     secrets=[hf_secret],
 )
 def run_gpu2():
-    r1 = run_hf.local("officehome")
+    r1 = run_officehome.local()
     r2 = run_hf.local("pacs")
     return {"officehome": r1, "pacs": r2}
 
@@ -738,12 +793,29 @@ def run_gpu3():
 # ─────────────────────────────────────────────────────────────────
 
 @app.local_entrypoint()
-def main():
+def main(job: str = "all"):
+    if job == "domainnet":
+        run_domainnet.remote()
+        return
+    if job == "officehome":
+        run_officehome.remote()
+        return
+    if job == "officehome+pacs":
+        run_gpu2.remote()
+        return
+    if job == "camelyon17+e3":
+        run_gpu3.remote()
+        return
+    if job != "all":
+        raise ValueError(
+            "job must be one of: all, domainnet, officehome, officehome+pacs, camelyon17+e3"
+        )
+
     jobs = {
         "gpu1 — domainnet":         run_gpu1.spawn(),
         "gpu2 — officehome + pacs": run_gpu2.spawn(),
         "gpu3 — camelyon17 + e3":   run_gpu3.spawn(),
     }
 
-    for job in jobs.values():
-        job.get()
+    for job_handle in jobs.values():
+        job_handle.get()

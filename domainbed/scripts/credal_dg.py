@@ -30,7 +30,6 @@ import torchvision.models as tv_models
 import torchvision.transforms as TVT
 from PIL import Image as PILImage
 from torch.utils.data import DataLoader, Dataset, Subset, TensorDataset
-from laplace import Laplace   # used only in fit_and_query_laplace (ablation)
 
 warnings.filterwarnings('ignore')
 
@@ -82,12 +81,16 @@ def parse_label_file(label_file: str, img_root: str) -> List[Tuple[str, int]]:
                 continue
             rel_path, label = parts
             label = int(label)
+            if 1 <= label <= N_CLASSES:
+                label -= 1
             full_path = Path(img_root) / rel_path
             if not full_path.exists():
                 # Some label files omit the leading domain prefix
                 alt_path = Path(img_root) / rel_path.split('/', 1)[-1]
                 if alt_path.exists():
                     full_path = alt_path
+            if not full_path.exists():
+                raise FileNotFoundError(f"Image referenced in label file not found: {full_path}")
             samples.append((str(full_path), label))
     return samples
 
@@ -96,12 +99,17 @@ def load_image(path: str, img_size: int = 224) -> np.ndarray:
     from PIL import Image
     try:
         img = Image.open(path).convert('RGB')
-        img = img.resize((img_size, img_size), Image.BILINEAR)
-        arr = np.array(img, dtype=np.float32) / 255.0
-        arr = (arr - IMAGENET_MEAN) / IMAGENET_STD
-        return arr.transpose(2, 0, 1)
+        return load_pil_image(img, img_size)
     except Exception:
         return np.zeros((3, img_size, img_size), dtype=np.float32)
+
+
+def load_pil_image(img: PILImage.Image, img_size: int = 224) -> np.ndarray:
+    img = img.convert('RGB')
+    img = img.resize((img_size, img_size), PILImage.BILINEAR)
+    arr = np.array(img, dtype=np.float32) / 255.0
+    arr = (arr - IMAGENET_MEAN) / IMAGENET_STD
+    return arr.transpose(2, 0, 1)
 
 
 class PACSDataset(Dataset):
@@ -116,6 +124,46 @@ class PACSDataset(Dataset):
         path, label = self.samples[idx]
         img = load_image(path, self.img_size)
         return torch.from_numpy(img), label
+
+
+class PACSHFDataset(Dataset):
+    def __init__(self, hf_split, indices: List[int], img_size: int = 224):
+        self.hf_split = hf_split
+        self.indices = indices
+        self.img_size = img_size
+
+    def __len__(self):
+        return len(self.indices)
+
+    def __getitem__(self, idx):
+        row = self.hf_split[int(self.indices[idx])]
+        img = load_pil_image(row['image'], self.img_size)
+        return torch.from_numpy(img), int(row['label'])
+
+
+def load_pacs_from_hf(hf_dir: Path, max_samples: int) -> Dict[str, List[int]]:
+    from datasets import load_from_disk
+
+    ds = load_from_disk(str(hf_dir))
+    if 'train' not in ds:
+        raise ValueError(f"Hugging Face PACS dataset at {hf_dir} has no 'train' split")
+
+    split = ds['train']
+    if not {'image', 'domain', 'label'}.issubset(split.features):
+        raise ValueError(
+            f"Hugging Face PACS dataset at {hf_dir} must contain image/domain/label features"
+        )
+
+    domain_indices = {}
+    for domain in DOMAINS:
+        indices = [i for i, value in enumerate(split['domain']) if value == domain]
+        if max_samples and len(indices) > max_samples:
+            rng = np.random.default_rng(42)
+            pick = rng.choice(len(indices), size=max_samples, replace=False)
+            indices = [indices[i] for i in pick]
+        domain_indices[domain] = indices
+
+    return {'split': split, 'domain_indices': domain_indices}
 
 
 # =============================================================================
@@ -197,28 +245,33 @@ def extract_credal_ellipsoid(
     passes   = torch.stack(passes)               # (H, N, 512)
     mu       = passes.mean(dim=0)                # (N, 512)
     sigma_sq = passes.var(dim=0, unbiased=True)  # (N, 512)  Σ_epi diagonal
+    sigma    = sigma_sq.sqrt()
 
-    # ε per instance: TV ball outer approximation radius
-    eps_per   = sigma_sq.max(dim=-1).values.sqrt()     # (N,)
+    # Canonical ε: sqrt(mean_d σ²_d), matching the local and certificate codepaths.
+    eps_per    = sigma_sq.mean(dim=-1).sqrt().clamp(1e-6, 1 - 1e-6)
     eps_domain = eps_per.mean().item()
 
     # MMI: support function of credal ellipsoid at widest feature direction
     # σ_d = sqrt(mean_n σ²_d(x))  — per-dimension std averaged over instances
-    sigma_d = sigma_sq.mean(dim=0).sqrt()        # (512,)
+    sigma_d = sigma.mean(dim=0)                  # (512,)
     mmi     = (2.0 * sigma_d.max()).item()
 
     return {
         'mu':         mu,
+        'sigma':      sigma,
         'sigma_sq':   sigma_sq,
+        'eps':        eps_per,
         'eps_per':    eps_per,
+        'epsilon':    eps_per,
         'eps_domain': eps_domain,
         'mmi':        mmi,
         'labels':     all_labels,
+        'n':          int(N),
     }
 
 
 # =============================================================================
-# 3. TRAIN LINEAR HEAD (MAP estimate for Laplace)
+# 3. TRAIN LINEAR HEAD
 # =============================================================================
 
 def train_head(
@@ -246,59 +299,33 @@ def train_head(
     head.eval()
 
 
-# =============================================================================
-# 4. LAPLACE APPROXIMATION  →  ε per domain
-# =============================================================================
+def load_backbone(arch: str = 'resnet18', device: str = 'cpu') -> Tuple[nn.Module, int]:
+    if arch != 'resnet18':
+        raise ValueError(f"Unsupported backbone for credal PACS extraction: {arch}")
+    model = FrozenResNet18WithDropout(num_classes=N_CLASSES).to(device)
+    model.eval()
+    return model, FEAT_DIM
 
-def fit_and_query_laplace(
-    head: nn.Linear,
-    src_feats: torch.Tensor,
-    src_labels: torch.Tensor,
-    tgt_feats: torch.Tensor,
-    device: str = 'cpu',
+
+def extract_credal_features(
+    backbone: nn.Module,
+    samples: List[Tuple[str, int]],
+    device: str,
+    n_heads: int = 5,
+    dropout_p: float = 0.15,
+    max_samples: Optional[int] = None,
+    batch_size: int = 32,
 ) -> Dict:
-    head = head.to(device)
-    dummy = nn.Sequential(nn.Identity(), nn.Identity(), head)
+    if not isinstance(backbone, FrozenResNet18WithDropout):
+        raise TypeError("extract_credal_features expects FrozenResNet18WithDropout from load_backbone()")
 
-    la = Laplace(
-        dummy,
-        likelihood='classification',
-        subset_of_weights='all',
-        hessian_structure='diag',
-    )
+    if max_samples is not None and len(samples) > max_samples:
+        samples = samples[:max_samples]
 
-    src_dl = DataLoader(
-        TensorDataset(src_feats.to(device), src_labels.to(device)),
-        batch_size=256, shuffle=True,
-    )
-    la.fit(src_dl)
-    la.optimize_prior_precision(method='marglik')
-
-    with torch.no_grad():
-        tgt_dev = tgt_feats.to(device)
-        f_mean, f_var = la._glm_predictive_distribution(tgt_dev)
-        if f_var.dim() == 3:
-            f_var = f_var.diagonal(dim1=-2, dim2=-1)   # (N, C)
-
-    # Per-instance logit std: mean over C classes, then sqrt
-    logit_std = f_var.mean(dim=-1).sqrt().cpu()         # (N,)
-
-    # Median-normalised sigmoid: robust to absolute variance scale
-    # σ > median → ε > 0.5 (more uncertain); σ < median → ε < 0.5
-    median_std   = logit_std.median()
-    eps_per_inst = torch.sigmoid(logit_std - median_std)  # (N,) ∈ (0,1)
-    eps_domain   = eps_per_inst.mean().item()
-
-    # MMI proxy: 2 * max_c sqrt(mean_n f_var[n,c])
-    per_class_std = f_var.cpu().mean(dim=0).sqrt()
-    mmi = (2.0 * per_class_std.max()).item()
-
-    return {
-        'eps':          eps_domain,
-        'eps_per_inst': eps_per_inst,
-        'f_var':        f_var.cpu(),
-        'mmi':          mmi,
-    }
+    backbone.drop.p = dropout_p
+    loader = DataLoader(PACSDataset(samples), batch_size=batch_size, shuffle=False)
+    feats = extract_credal_ellipsoid(loader, backbone, device, H=n_heads)
+    return feats
 
 
 # =============================================================================
@@ -312,11 +339,6 @@ def compute_mmd_linear(
     mu_s = torch.cat(mu_sources, dim=0).mean(dim=0)  # (512,)
     mu_t = mu_target.mean(dim=0)                      # (512,)
     return (mu_s - mu_t).norm().item()
-
-
-def compute_mmi_from_laplace(f_var: torch.Tensor) -> float:
-    per_class_std = f_var.mean(dim=0).sqrt()          # (C,)
-    return (2.0 * per_class_std.max()).item()
 
 
 # =============================================================================
@@ -629,9 +651,9 @@ class EpsEstimator(ABC):
 
     @staticmethod
     def _pack(mu: torch.Tensor, sigma: torch.Tensor, D: int) -> dict:
-        eps = (sigma.pow(2).mean(dim=1).sqrt() / math.sqrt(D)).clamp(1e-6, 1 - 1e-6)
+        eps = sigma.pow(2).mean(dim=1).sqrt().clamp(1e-6, 1 - 1e-6)
         mmi = 2.0 * sigma.max(dim=1).values
-        return {'mu': mu, 'sigma': sigma, 'eps': eps, 'mmi': mmi}
+        return {'mu': mu, 'sigma': sigma, 'eps': eps, 'epsilon': eps, 'mmi': mmi}
 
 
 class MCDropoutEstimator(EpsEstimator):
@@ -657,69 +679,6 @@ class MCDropoutEstimator(EpsEstimator):
         sigma = torch.cat(all_sigma, dim=0)
         D = mu.shape[1]
         return self._pack(mu, sigma, D)
-
-
-class LaplaceEstimatorMPS(EpsEstimator):
-    def estimate(self, loader: DataLoader, device: str) -> dict:
-        from laplace import Laplace
-
-        base = tv_models.resnet18(
-            weights=tv_models.ResNet18_Weights.IMAGENET1K_V1
-        ).to(device).eval()
-        for name, p in base.named_parameters():
-            if 'fc' not in name:
-                p.requires_grad_(False)
-
-        la = Laplace(
-            base,
-            likelihood='classification',
-            subset_of_weights='last_layer',
-            hessian_structure='diag',
-        )
-
-        pseudo_data = []
-        with torch.no_grad():
-            for batch in loader:
-                x = batch.to(device)
-                out = base(x)
-                y = out.argmax(1)
-                pseudo_data.append((x.cpu(), y.cpu()))
-
-        class PseudoDS(Dataset):
-            def __init__(self, data):
-                self.x = torch.cat([d[0] for d in data])
-                self.y = torch.cat([d[1] for d in data])
-
-            def __len__(self):
-                return len(self.x)
-
-            def __getitem__(self, i):
-                return self.x[i], self.y[i]
-
-        pseudo_ldr = DataLoader(PseudoDS(pseudo_data), batch_size=64, shuffle=False)
-        la.fit(pseudo_ldr)
-        la.optimize_prior_precision(method='marglik')
-
-        post_var = la.posterior_variance
-        D_feat = base.fc.in_features
-        K_out = base.fc.out_features
-        var_W = post_var.reshape(K_out, D_feat)
-        var_per_feat = var_W.mean(0)
-
-        feat_extractor = nn.Sequential(
-            *list(base.children())[:-1], nn.Flatten()
-        ).to(device).eval()
-
-        all_mu = []
-        with torch.no_grad():
-            for batch in loader:
-                x = batch.to(device)
-                all_mu.append(feat_extractor(x).cpu())
-
-        mu = torch.cat(all_mu, dim=0)
-        sigma = var_per_feat.sqrt().unsqueeze(0).expand_as(mu)
-
-        return self._pack(mu, sigma, D_feat)
 
 
 class DeepEnsembleEstimator(EpsEstimator):
@@ -922,9 +881,9 @@ def run_e3_mps(
             mu = torch.cat(all_mu)
             sigma = torch.cat(all_sigma)
             D = mu.shape[1]
-            eps = (sigma.pow(2).mean(1).sqrt() / math.sqrt(D)).clamp(1e-6, 1 - 1e-6)
+            eps = sigma.pow(2).mean(1).sqrt().clamp(1e-6, 1 - 1e-6)
             mmi = 2.0 * sigma.max(1).values
-            domain_feats[dom] = {'mu': mu, 'sigma': sigma, 'eps': eps, 'mmi': mmi}
+            domain_feats[dom] = {'mu': mu, 'sigma': sigma, 'eps': eps, 'epsilon': eps, 'mmi': mmi}
 
         pool = {
             'mu': torch.cat([domain_feats[d]['mu'] for d in sources]),
@@ -985,14 +944,11 @@ DEFAULT_MPS_ROOTS = {
 def build_estimators_mps(choice: str) -> Dict[str, EpsEstimator]:
     if choice == 'dropout':
         return {'dropout': MCDropoutEstimator(H=5, p=0.15)}
-    if choice == 'laplace':
-        return {'laplace': LaplaceEstimatorMPS()}
     if choice == 'ensemble':
         return {'ensemble': DeepEnsembleEstimator(seeds=ENSEMBLE_SEEDS)}
     if choice == 'all':
         return {
             'dropout': MCDropoutEstimator(H=5, p=0.15),
-            'laplace': LaplaceEstimatorMPS(),
             'ensemble': DeepEnsembleEstimator(seeds=ENSEMBLE_SEEDS),
         }
     raise ValueError(choice)
@@ -1008,7 +964,7 @@ def parse_args_mps():
     p.add_argument('--data_root', type=Path, default=None,
                    help='Root with one subdir per domain (ImageFolder layout)')
     p.add_argument('--estimator', default='dropout',
-                   choices=['dropout', 'laplace', 'ensemble', 'all'])
+                   choices=['dropout', 'ensemble', 'all'])
     p.add_argument('--device', default='auto',
                    choices=['auto', 'cpu', 'cuda', 'mps'])
     p.add_argument('--n', type=int, default=400, help='Instances per domain')
@@ -1222,9 +1178,9 @@ def extract_domain_feats_wilds(
         all_sigma.append(passes.std(1).cpu())
     mu = torch.cat(all_mu)
     sigma = torch.cat(all_sigma)
-    eps = (sigma.pow(2).mean(1).sqrt() / math.sqrt(D)).clamp(1e-6, 1 - 1e-6)
+    eps = sigma.pow(2).mean(1).sqrt().clamp(1e-6, 1 - 1e-6)
     mmi = 2.0 * sigma.max(1).values
-    return {'mu': mu, 'sigma': sigma, 'eps': eps, 'mmi': mmi}
+    return {'mu': mu, 'sigma': sigma, 'eps': eps, 'epsilon': eps, 'mmi': mmi}
 
 
 def compute_certificate_wilds(
@@ -1476,8 +1432,11 @@ def main():
     parser = argparse.ArgumentParser(
         description='Credal IIPM vs MMD on PACS — credal ellipsoid ε'
     )
-    parser.add_argument('--pacs_root',   type=str, required=True,
+    parser.add_argument('--pacs_root',   type=str, default=None,
                         help='Path to PACS/ (contains pacs_data/ pacs_label/)')
+    parser.add_argument('--hf_pacs_dir', type=str,
+                        default='/media/data/tanmoy/flwrlabs_pacs_saved',
+                        help='Local Hugging Face PACS dataset saved via load_from_disk')
     parser.add_argument('--output_dir',  type=str, default='credal_dg_results')
     parser.add_argument('--max_samples', type=int, default=400)
     parser.add_argument('--split',       type=str, default='test',
@@ -1492,40 +1451,58 @@ def main():
     parser.add_argument('--dropout_p',   type=float, default=0.15)
     args = parser.parse_args()
 
-    pacs_root  = Path(args.pacs_root)
-    img_root   = pacs_root / 'pacs_data'
-    label_root = pacs_root / 'pacs_label'
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-
-    if not img_root.exists():
-        raise FileNotFoundError(f"pacs_data/ not found at {img_root}")
-    if not label_root.exists():
-        raise FileNotFoundError(f"pacs_label/ not found at {label_root}")
 
     device = pick_device(args.device)
 
     # ── Load samples ──────────────────────────────────────────────────────
-    domain_samples = {}
-    for domain in DOMAINS:
-        label_file = label_root / f'{domain}_{args.split}_kfold.txt'
-        samples = parse_label_file(str(label_file), str(img_root))
-        if args.max_samples and len(samples) > args.max_samples:
-            rng = np.random.default_rng(42)
-            idx = rng.choice(len(samples), size=args.max_samples, replace=False)
-            samples = [samples[i] for i in idx]
-        domain_samples[domain] = samples
+    domain_loaders = {}
+    pacs_root = Path(args.pacs_root).expanduser() if args.pacs_root else None
+    hf_pacs_dir = Path(args.hf_pacs_dir).expanduser() if args.hf_pacs_dir else None
 
-    # ── Build loaders (images stay on disk, loaded on demand) ─────────────
-    # We keep loaders rather than cached tensors so extract_credal_ellipsoid
-    # can re-pass images H times with fresh dropout masks.
-    domain_loaders = {
-        d: DataLoader(
-            PACSDataset(domain_samples[d], img_size=args.img_size),
-            batch_size=args.batch_size, shuffle=False, num_workers=0,
+    if pacs_root is not None:
+        img_root = pacs_root / 'pacs_data'
+        label_root = pacs_root / 'pacs_label'
+        if not img_root.exists():
+            raise FileNotFoundError(f"pacs_data/ not found at {img_root}")
+        if not label_root.exists():
+            raise FileNotFoundError(f"pacs_label/ not found at {label_root}")
+
+        domain_samples = {}
+        for domain in DOMAINS:
+            label_file = label_root / f'{domain}_{args.split}_kfold.txt'
+            samples = parse_label_file(str(label_file), str(img_root))
+            if args.max_samples and len(samples) > args.max_samples:
+                rng = np.random.default_rng(42)
+                idx = rng.choice(len(samples), size=args.max_samples, replace=False)
+                samples = [samples[i] for i in idx]
+            domain_samples[domain] = samples
+
+        # We keep loaders rather than cached tensors so extract_credal_ellipsoid
+        # can re-pass images H times with fresh dropout masks.
+        domain_loaders = {
+            d: DataLoader(
+                PACSDataset(domain_samples[d], img_size=args.img_size),
+                batch_size=args.batch_size, shuffle=False, num_workers=0,
+            )
+            for d in DOMAINS
+        }
+    elif hf_pacs_dir is not None and hf_pacs_dir.exists():
+        hf_data = load_pacs_from_hf(hf_pacs_dir, max_samples=args.max_samples)
+        hf_split = hf_data['split']
+        domain_loaders = {
+            d: DataLoader(
+                PACSHFDataset(hf_split, hf_data['domain_indices'][d], img_size=args.img_size),
+                batch_size=args.batch_size, shuffle=False, num_workers=0,
+            )
+            for d in DOMAINS
+        }
+    else:
+        raise FileNotFoundError(
+            'Provide --pacs_root pointing to pacs_data/pacs_label, or ensure '
+            f'--hf_pacs_dir exists (current default: {hf_pacs_dir})'
         )
-        for d in DOMAINS
-    }
 
     # ── Build backbone ────────────────────────────────────────────────────
     model = FrozenResNet18WithDropout(

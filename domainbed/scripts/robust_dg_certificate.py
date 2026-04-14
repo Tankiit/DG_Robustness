@@ -73,10 +73,10 @@ DOMAIN_COLORS = {
 # Published ERM accuracy — the y-axis ground truth
 # Source: Gulrajani & Lopez-Paz (2021), training-domain validation
 ERM_ACC = {
-    'art_painting': 77.2,
-    'cartoon':      75.8,
-    'photo':        96.0,
-    'sketch':       69.2,
+    'art_painting': 84.7,
+    'cartoon':      80.8,
+    'photo':        97.2,
+    'sketch':       79.3,
 }
 
 # Published GroupDRO accuracy (same backbone, same split)
@@ -111,6 +111,31 @@ def convert_numpy_types(obj):
     return obj
 
 
+def canonicalize_feature_dict(feats: Dict) -> Dict:
+    """
+    Normalise feature-cache schema across old and new credal_dg outputs.
+    """
+    out = dict(feats)
+    eps = out.get('eps', out.get('epsilon', out.get('eps_per')))
+    if eps is None:
+        raise KeyError("Feature dict is missing epsilon values")
+    out['eps'] = eps
+    out['epsilon'] = eps
+
+    if 'sigma' not in out and 'sigma_sq' in out:
+        out['sigma'] = np.sqrt(out['sigma_sq'])
+
+    if 'n' not in out and 'mu' in out:
+        out['n'] = int(len(out['mu']))
+
+    return out
+
+
+def canonicalize_domain_feats(domain_feats: Dict[str, Dict]) -> Dict[str, Dict]:
+    return {domain: canonicalize_feature_dict(feats)
+            for domain, feats in domain_feats.items()}
+
+
 # =============================================================================
 # PART 0 — Feature extraction (reuses credal_dg_pacs logic)
 # =============================================================================
@@ -131,7 +156,7 @@ def load_or_extract_features(
     if feats_npz and Path(feats_npz).exists():
 
         data = np.load(feats_npz, allow_pickle=True)
-        return data['domain_feats'].item()
+        return canonicalize_domain_feats(data['domain_feats'].item())
 
     if pacs_root is None:
         raise ValueError(
@@ -168,10 +193,8 @@ def load_or_extract_features(
             backbone, samples, device,
             n_heads=n_heads, dropout_p=dropout_p, max_samples=max_samples
         )
-        n = domain_feats[domain]['n']
 
-
-    return domain_feats
+    return canonicalize_domain_feats(domain_feats)
 
 
 # =============================================================================
@@ -190,9 +213,9 @@ def eps_domain(feats: Dict) -> Tuple[float, float, np.ndarray]:
     Returns:
       eps_mean  : E[ε(x)]  = mean credal width
       eps_max   : max ε(x) = fixed-ε equivalent
-      eps_vec   : (N,) per-instance ε(x) = √Tr(Σ_epi(x))
+      eps_vec   : (N,) per-instance ε(x)
     """
-    eps_vec  = feats['epsilon']             # (N,) already computed
+    eps_vec  = feats['eps']                 # (N,) already computed
     return float(eps_vec.mean()), float(eps_vec.max()), eps_vec
 
 
@@ -289,8 +312,8 @@ def experiment_1_prediction(
         mmd  = float(np.linalg.norm(mu_train - mu_test))
 
         # ε = max(ε_source, ε_test)
-        eps_train = np.concatenate([f['epsilon'] for f in train_feats]).mean()
-        eps_test  = test_feats['epsilon'].mean()
+        eps_train = np.concatenate([f['eps'] for f in train_feats]).mean()
+        eps_test  = test_feats['eps'].mean()
         eps       = float(max(eps_train, eps_test))
 
         iipm      = route_a_iipm(eps, mmd)
@@ -363,8 +386,8 @@ def experiment_2_nonvacuous(
         mu_test  = test_feats['mu'].mean(0)
         mmd      = float(np.linalg.norm(mu_train - mu_test))
 
-        eps_train = np.concatenate([f['epsilon'] for f in train_feats]).mean()
-        eps_test  = test_feats['epsilon'].mean()
+        eps_train = np.concatenate([f['eps'] for f in train_feats]).mean()
+        eps_test  = test_feats['eps'].mean()
         eps       = float(max(eps_train, eps_test))
 
         # Route A certificate
@@ -428,7 +451,7 @@ def experiment_3_adaptive(
       gap > 0 iff ε(x) varies across instances AND M > E[ℓ]
 
     Key connection to UAI paper:
-      ε(x) = √Tr(Σ_epi(x)) is already trained to be heterogeneous
+      ε(x) is already trained to be heterogeneous
       (Mode C joint training). The UAI result (ρ(ε,flip) ≈ 0.64)
       means ε(x) is calibrated — high ε → high flip probability.
       This calibration is what makes adaptive ε tighter than fixed ε_max.
@@ -441,7 +464,7 @@ def experiment_3_adaptive(
 
     for domain in DOMAINS:
         feats     = domain_feats[domain]
-        eps_vec   = feats['epsilon']       # (N,) per-instance ε(x)
+        eps_vec   = feats['eps']           # (N,) per-instance ε(x)
         acc       = held_out_acc[domain]
         ell_mean  = 1.0 - acc / 100.0     # proxy for E[ℓ(h,x)]
 

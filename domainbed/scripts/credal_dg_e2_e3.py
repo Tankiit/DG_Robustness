@@ -4,8 +4,9 @@ credal_dg_e2_e3.py
 E2 — Non-vacuousness: is B·(1−ε)·MMD < M = log(K)?
 E3 — ε stability:     do per-domain ε rankings hold across H ∈ {1,5,10,20}?
 
-Both experiments run on top of the feature cache produced by credal_dg_pacs.py.
-No re-extraction needed if feats_cache_*.pt exists.
+Both experiments use the same MC-dropout feature uncertainty used elsewhere in
+the credal DG scripts. Cached metadata can avoid relisting PACS label files,
+but the uncertainty statistics are extracted from images directly.
 
 USAGE:
     # Run both experiments
@@ -44,7 +45,6 @@ import torch
 import torch.nn as nn
 import torchvision.models as tvm
 from torch.utils.data import DataLoader, Dataset, TensorDataset
-from laplace import Laplace
 
 warnings.filterwarnings('ignore')
 
@@ -153,6 +153,44 @@ def extract_features(
     return torch.cat(feats), torch.cat(labels)
 
 
+def extract_credal_features(
+    samples: List[Tuple[str, int]],
+    model: FrozenResNet18,
+    device: str,
+    H: int,
+    batch_size: int = 32,
+) -> Dict:
+    """H MC-dropout passes returning canonical credal feature statistics."""
+    model.train()
+    for m in model.modules():
+        if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d)):
+            m.eval()
+
+    loader = DataLoader(PACSDataset(samples), batch_size=batch_size,
+                        shuffle=False, num_workers=0)
+    passes = []
+    with torch.no_grad():
+        for _ in range(H):
+            h_feats = []
+            for imgs, lbl in loader:
+                h_feats.append(model.get_features(imgs.to(device)).cpu())
+            passes.append(torch.cat(h_feats))
+
+    stacked = torch.stack(passes, dim=0)             # (H, N, D)
+    mu = stacked.mean(dim=0)
+    sigma = stacked.std(dim=0)
+    eps = sigma.pow(2).mean(dim=1).sqrt().clamp(1e-6, 1 - 1e-6)
+    mmi = 2.0 * sigma.mean(dim=0).max().item()
+
+    return {
+        'mu': mu,
+        'sigma': sigma,
+        'eps': eps,
+        'mmi': mmi,
+        'labels': torch.tensor([label for _, label in samples], dtype=torch.long),
+    }
+
+
 def train_head(
     head: nn.Linear,
     src_feats: torch.Tensor,
@@ -173,45 +211,6 @@ def train_head(
     head.eval()
 
 
-def fit_laplace_eps(
-    head: nn.Linear,
-    src_feats: torch.Tensor,
-    src_labels: torch.Tensor,
-    tgt_feats: torch.Tensor,
-    device: str,
-) -> Dict:
-    """
-    Diagonal Laplace on the full linear head.
-    Returns eps (scalar), eps_per_inst (N,), f_var (N, C).
-    ε normalised via sigmoid(logit_std − 1.0) → (0, 1).
-    """
-    head = head.to(device)
-    dummy = nn.Sequential(nn.Identity(), nn.Identity(), head)
-
-    la = Laplace(dummy, likelihood='classification',
-                 subset_of_weights='all', hessian_structure='diag')
-
-    dl = DataLoader(TensorDataset(src_feats.to(device), src_labels.to(device)),
-                    batch_size=256, shuffle=True)
-    la.fit(dl)
-    la.optimize_prior_precision(method='marglik')
-
-    with torch.no_grad():
-        tgt_dev = tgt_feats.to(device)
-        f_mean, f_var = la._glm_predictive_distribution(tgt_dev)
-        if f_var.dim() == 3:
-            f_var = f_var.diagonal(dim1=-2, dim2=-1)   # (N, C)
-
-    logit_std = f_var.mean(dim=-1).sqrt().cpu()         # (N,)
-    eps_per   = torch.sigmoid(logit_std - 1.0)          # (0, 1)
-    eps       = eps_per.mean().item()
-
-    per_class_std = f_var.cpu().mean(dim=0).sqrt()
-    mmi = (2.0 * per_class_std.max()).item()
-
-    return {'eps': eps, 'eps_per_inst': eps_per, 'f_var': f_var.cpu(), 'mmi': mmi}
-
-
 def compute_mmd(
     src_list: List[torch.Tensor],
     tgt: torch.Tensor,
@@ -226,14 +225,17 @@ def compute_mmd(
 # =============================================================================
 
 def run_e2(
-    domain_feats: Dict[str, Tuple[torch.Tensor, torch.Tensor]],
+    domain_samples: Dict[str, List[Tuple[str, int]]],
+    model: FrozenResNet18,
     device: str,
+    H: int,
+    batch_size: int = 32,
     head_epochs: int = 15,
 ) -> List[Dict]:
     """
     For each held-out domain, compute:
       B  = spectral norm of trained head weight matrix
-      ε  = Laplace posterior mean epistemic uncertainty
+      ε  = MC-dropout feature uncertainty
       MMD = linear kernel distance to source
       bound = B · (1−ε) · MMD
       M  = log(N_CLASSES)   ← max possible cross-entropy loss
@@ -245,9 +247,13 @@ def run_e2(
 
     for held_out in DOMAINS:
         sources     = [d for d in DOMAINS if d != held_out]
-        src_feats   = torch.cat([domain_feats[d][0] for d in sources])
-        src_labels  = torch.cat([domain_feats[d][1] for d in sources])
-        tgt_feats, _= domain_feats[held_out]
+        extracted = {
+            d: extract_credal_features(domain_samples[d], model, device, H, batch_size)
+            for d in [held_out] + sources
+        }
+        src_feats = torch.cat([extracted[d]['mu'] for d in sources])
+        src_labels = torch.cat([extracted[d]['labels'] for d in sources])
+        tgt_feats = extracted[held_out]['mu']
 
         head = nn.Linear(FEAT_DIM, N_CLASSES).to(device)
         train_head(head, src_feats, src_labels, device, epochs=head_epochs)
@@ -255,9 +261,8 @@ def run_e2(
         # B = spectral norm of W (2-norm of the weight matrix)
         B = torch.linalg.norm(head.weight.detach(), ord=2).item()
 
-        lap  = fit_laplace_eps(head, src_feats, src_labels, tgt_feats, device)
-        eps  = lap['eps']
-        mmd  = compute_mmd([domain_feats[d][0] for d in sources], tgt_feats)
+        eps  = extracted[held_out]['eps'].mean().item()
+        mmd  = compute_mmd([extracted[d]['mu'] for d in sources], tgt_feats)
         cert = B * (1.0 - eps) * mmd
 
         # Proxy actual risk gap: |mean_source_acc - target_acc|
@@ -284,7 +289,7 @@ def run_e2(
             'M':            M,
             'non_vacuous':  non_vac,
             'actual_gap':   actual_gap,
-            'mmi':          lap['mmi'],
+            'mmi':          extracted[held_out]['mmi'],
         })
 
     return records
@@ -333,57 +338,21 @@ def write_e2_table(records: List[Dict], output_path: str) -> None:
 # =============================================================================
 
 def run_e3_one_H(
-    domain_feats: Dict[str, Tuple[torch.Tensor, torch.Tensor]],
+    domain_samples: Dict[str, List[Tuple[str, int]]],
     model: FrozenResNet18,
     device: str,
     H: int,
-    head_epochs: int = 15,
+    batch_size: int = 32,
 ) -> Dict[str, float]:
     """
     Run full LODO experiment for a given H (number of dropout passes).
 
-    ε is computed as the mean of H independent stochastic passes through
-    the Laplace GLM predictive distribution, approximated by running the
-    Laplace fit H times with different dropout masks on the features.
-
-    In practice: we re-extract features H times (dropout active each time)
-    and average the resulting ε estimates per domain.
+    ε is computed directly from H MC-dropout passes through the backbone.
     """
-    eps_per_domain = {d: [] for d in DOMAINS}
-
-    for h in range(H):
-        # Re-extract features with fresh dropout mask
-        fresh_feats = {}
-        for d, (_, labels) in domain_feats.items():
-            # Re-use stored labels but re-extract features with new dropout
-            # Note: domain_feats stores ONE stochastic pass.
-            # For H passes, we perturb the stored features with additional
-            # dropout noise to simulate H independent passes.
-            # This is equivalent to H forward passes if dropout is applied
-            # post-backbone (which it is in our architecture).
-            stored_feats = domain_feats[d][0]
-            # Apply an additional Bernoulli mask to simulate dropout
-            # p_keep = 1 - dropout_p
-            p_keep = 1.0 - model.drop.p
-            mask   = torch.bernoulli(
-                torch.full_like(stored_feats, p_keep)
-            ) / p_keep  # scale to preserve expectation
-            fresh_feats[d] = (stored_feats * mask, labels)
-
-        for held_out in DOMAINS:
-            sources    = [d for d in DOMAINS if d != held_out]
-            src_feats  = torch.cat([fresh_feats[d][0] for d in sources])
-            src_labels = torch.cat([fresh_feats[d][1] for d in sources])
-            tgt_feats  = fresh_feats[held_out][0]
-
-            head = nn.Linear(FEAT_DIM, N_CLASSES).to(device)
-            train_head(head, src_feats, src_labels, device, epochs=head_epochs)
-
-            lap = fit_laplace_eps(head, src_feats, src_labels, tgt_feats, device)
-            eps_per_domain[held_out].append(lap['eps'])
-
-    # Average ε across H passes per domain
-    return {d: float(np.mean(eps_per_domain[d])) for d in DOMAINS}
+    return {
+        d: float(extract_credal_features(domain_samples[d], model, device, H, batch_size)['eps'].mean())
+        for d in DOMAINS
+    }
 
 
 def compute_kendall_tau_stability(
@@ -442,7 +411,7 @@ def plot_e3_stability(
     ax1.set_xticklabels(
         [d.replace('_', '\n') for d in DOMAINS], fontsize=8
     )
-    ax1.set_ylabel('ε (mean Laplace epistemic uncertainty)', fontsize=8)
+    ax1.set_ylabel('ε (mean MC-dropout feature uncertainty)', fontsize=8)
     ax1.set_title('E3: per-domain ε across H dropout passes', fontsize=9)
     ax1.legend(fontsize=7, ncol=2)
     ax1.grid(True, axis='y', alpha=0.25)
@@ -618,11 +587,11 @@ def main():
     cache_path = results_dir / f"feats_cache_drop{args.dropout_p}_max{args.max_samples}.pt"
 
     if cache_path.exists():
-        print(f"\nLoading feature cache: {cache_path.name}")
+        print(f"\nLoading sample cache: {cache_path.name}")
         domain_feats = torch.load(cache_path, map_location='cpu')
         backbone = FrozenResNet18(p_drop=args.dropout_p).to(device)
     else:
-        print(f"\nCache not found at {cache_path}. Extracting features...")
+        print(f"\nCache not found at {cache_path}. Building sample index...")
         pacs_root  = Path(args.pacs_root)
         img_root   = pacs_root / 'pacs_data'
         label_root = pacs_root / 'pacs_label'
@@ -637,10 +606,8 @@ def main():
                 rng = np.random.default_rng(42)
                 idx = rng.choice(len(samples), args.max_samples, replace=False)
                 samples = [samples[i] for i in idx]
-            print(f"  [{domain}] extracting {len(samples)} samples...")
-            feats, labels = extract_features(samples, backbone, device,
-                                              args.batch_size)
-            domain_feats[domain] = (feats, labels)
+            print(f"  [{domain}] indexing {len(samples)} samples...")
+            domain_feats[domain] = samples
 
         print(f"  Saving cache to {cache_path}")
         torch.save(domain_feats, cache_path)
@@ -653,7 +620,10 @@ def main():
         print(f"  M = log({N_CLASSES}) = {math.log(N_CLASSES):.4f}")
         print(f"{'='*55}")
 
-        e2_records = run_e2(domain_feats, device, args.head_epochs)
+        e2_records = run_e2(
+            domain_feats, backbone, device,
+            H=5, batch_size=args.batch_size, head_epochs=args.head_epochs,
+        )
 
         # Save JSON
         e2_path = output_dir / 'e2_nonvacuous.json'
@@ -674,7 +644,7 @@ def main():
         for H in args.H_values:
             print(f"\n  H = {H} ({H} dropout passes per domain)...")
             eps_by_H[H] = run_e3_one_H(
-                domain_feats, backbone, device, H, args.head_epochs
+                domain_feats, backbone, device, H, args.batch_size
             )
             for d in DOMAINS:
                 print(f"    {d:<15}  ε = {eps_by_H[H][d]:.4f}")
